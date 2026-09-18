@@ -17,6 +17,12 @@ RUNNING = "running"
 SUCCEEDED = "succeeded"
 FAILED = "failed"
 BLOCKED = "blocked"
+CANCELED = "canceled"
+
+# 终态：不再随上游失败/取消而改变；取消递归时一律跳过
+TERMINAL_STATES = (SUCCEEDED, FAILED, CANCELED)
+# 允许取消的状态
+CANCELABLE_STATES = (PENDING, RUNNING, BLOCKED)
 
 # 尝试状态
 A_ACTIVE = "active"
@@ -32,6 +38,7 @@ EVT_TASK_SUCCEEDED = "task.succeeded"
 EVT_TASK_FAILED = "task.failed"
 EVT_TASK_BLOCKED = "task.blocked"
 EVT_TASK_RESUMED = "task.resumed"
+EVT_TASK_CANCELED = "task.canceled"
 
 
 def _append_event(
@@ -541,7 +548,7 @@ def _block_descendants(conn, dag_id: str, root_key: str, occurred_at: str) -> in
             (dag_id, r["task_key"]),
         ).fetchone()
         # 已结束的任务不改变；运行中的任务即使租约有效也视为被阻塞
-        if target["state"] in (SUCCEEDED, FAILED, BLOCKED):
+        if target["state"] in (SUCCEEDED, FAILED, BLOCKED, CANCELED):
             continue
         reason = f"upstream '{root_key}' permanently failed"
         conn.execute(
@@ -891,6 +898,127 @@ def resume_task(task_id: str) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------- 任务取消
+
+def cancel_task(task_id: str) -> dict[str, Any]:
+    """取消任务：pending/running/blocked -> canceled，并递归取消所有未结束后继。
+
+    单事务内完成：目标任务与每个实际改变的后继均置为 canceled（终态，不再参与
+    领取），并各追加一条 task.canceled 事件。若目标（或某后继）正在运行，立即
+    终止当前 attempt（active -> expired）并清除租约令牌/过期时刻/worker：旧
+    lease_token 此后的心跳与完成回报都因令牌不再匹配任何租约而返回 409。
+    已 succeeded/failed/canceled 的后继保持原样，不产生事件。重复取消（目标已
+    处于 canceled 或其他终态/不可取消状态）返回 409 且不产生任何事件。
+    """
+    now_iso = _iso(_now())
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            root = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if root is None:
+                raise APIError(404, "task_not_found", f"任务 {task_id} 不存在")
+            if root["state"] not in CANCELABLE_STATES:
+                # canceled（重复取消）与 succeeded/failed 均在此：409 且不产生事件
+                raise APIError(
+                    409,
+                    "task_not_cancelable",
+                    "只有 pending、running 或 blocked 状态的任务才能取消",
+                    {"task_id": task_id, "state": root["state"]},
+                )
+            dag_id = root["dag_id"]
+            root_key = root["task_key"]
+
+            # 先在同一快照内载入整图（状态变更前），保证事件的 from_state 为原值
+            task_rows = conn.execute(
+                "SELECT id, task_key, state, attempt FROM tasks WHERE dag_id = ?",
+                (dag_id,),
+            ).fetchall()
+            dep_rows = conn.execute(
+                "SELECT task_key, dep_key FROM dependencies WHERE dag_id = ?",
+                (dag_id,),
+            ).fetchall()
+
+            states = {r["task_key"]: r["state"] for r in task_rows}
+            ids = {r["task_key"]: r["id"] for r in task_rows}
+            attempts = {r["task_key"]: r["attempt"] for r in task_rows}
+            deps: dict[str, list[str]] = {k: [] for k in states}
+            succ: dict[str, list[str]] = {k: [] for k in states}
+            for d in dep_rows:
+                deps[d["task_key"]].append(d["dep_key"])
+                succ[d["dep_key"]].append(d["task_key"])
+
+            def cancel_one(key: str) -> None:
+                """将单个未结束任务置为 canceled，终止其活动尝试并追加事件。"""
+                old_state = states[key]
+                conn.execute(
+                    """UPDATE tasks
+                       SET state = 'canceled', blocked_reason = NULL,
+                           lease_token = NULL, lease_expires_at = NULL, worker_id = NULL,
+                           next_eligible_at = NULL, finished_at = ?
+                       WHERE id = ?""",
+                    (now_iso, ids[key]),
+                )
+                # 运行中任务：当前 attempt 立即终止（active -> expired），旧令牌失效
+                conn.execute(
+                    "UPDATE attempts SET state = 'expired' WHERE task_id = ? AND state = 'active'",
+                    (ids[key],),
+                )
+                states[key] = CANCELED
+                _append_event(
+                    conn,
+                    EVT_TASK_CANCELED,
+                    dag_id,
+                    now_iso,
+                    task_id=ids[key],
+                    attempt=attempts[key],
+                    from_state=old_state,
+                    to_state=CANCELED,
+                )
+
+            # 根任务先取消：其事件先于后继落库，保持因果顺序
+            cancel_one(root_key)
+
+            # 根的全部直接/间接后继集合
+            descendants: set[str] = set()
+            stack = [root_key]
+            while stack:
+                u = stack.pop()
+                for v in succ[u]:
+                    if v not in descendants:
+                        descendants.add(v)
+                        stack.append(v)
+
+            # 拓扑序（Kahn，堆按 key 字典序保证事件顺序确定）：前驱先于后继评估，
+            # 终态（succeeded/failed/canceled）后继跳过且不产生事件
+            indeg = {k: len(deps[k]) for k in states}
+            heap = [k for k in states if indeg[k] == 0]
+            heapq.heapify(heap)
+            canceled_count = 0
+            while heap:
+                u = heapq.heappop(heap)
+                if u in descendants and states[u] not in TERMINAL_STATES:
+                    # 依赖门控保证未结束后继只可能是 pending/blocked（running 后继
+                    # 仅可能来自异常存储）；终态后继保持原样、不产生事件
+                    cancel_one(u)
+                    canceled_count += 1
+                for v in succ[u]:
+                    indeg[v] -= 1
+                    if indeg[v] == 0:
+                        heapq.heappush(heap, v)
+
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    return {
+        "task_id": task_id,
+        "state": CANCELED,
+        "attempt": root["attempt"],
+        "canceled_descendants": canceled_count,
+    }
+
+
 # ---------------------------------------------------------------- 状态查询
 
 def _attempts(conn, task_id: str) -> list[dict[str, Any]]:
@@ -1005,7 +1133,7 @@ def _dag_summary(conn, dag_id: str) -> dict[str, Any]:
                 "SELECT COUNT(*) FROM tasks WHERE dag_id = ? AND state = ?", (dag_id, s)
             ).fetchone()[0]
         )
-        for s in (PENDING, RUNNING, SUCCEEDED, FAILED, BLOCKED)
+        for s in (PENDING, RUNNING, SUCCEEDED, FAILED, BLOCKED, CANCELED)
     }
     return counts
 
