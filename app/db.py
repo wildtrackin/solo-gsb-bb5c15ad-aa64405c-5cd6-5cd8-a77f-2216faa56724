@@ -76,7 +76,7 @@ def init_db(path: Path | None = None) -> None:
                 lease_seconds       REAL NOT NULL,
                 -- 预计执行时长（秒），只读分析用于关键路径/排程计算
                 duration_seconds    REAL NOT NULL DEFAULT 1.0,
-                state               TEXT NOT NULL,        -- pending/running/succeeded/failed/blocked
+                state               TEXT NOT NULL,        -- pending/running/succeeded/failed/blocked/canceled
                 blocked_reason      TEXT,
                 lease_token         TEXT,
                 lease_expires_at    TEXT,
@@ -119,7 +119,7 @@ def init_db(path: Path | None = None) -> None:
                 leased_at      TEXT NOT NULL,
                 expires_at     TEXT NOT NULL,
                 heartbeat_at   TEXT,
-                state          TEXT NOT NULL,   -- active/expired/succeeded/failed
+                state          TEXT NOT NULL,   -- active/expired/succeeded/failed/canceled
                 error          TEXT
             );
 
@@ -143,7 +143,7 @@ def init_db(path: Path | None = None) -> None:
             -- 与对应业务变更在同一事务内写入，事务回滚则事件一并消失。
             CREATE TABLE IF NOT EXISTS events (
                 sequence      INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_type    TEXT NOT NULL,   -- dag.created/task.claimed/task.requeued/task.succeeded/task.failed/task.blocked/task.resumed
+                event_type    TEXT NOT NULL,   -- dag.created/task.claimed/task.requeued/task.succeeded/task.failed/task.blocked/task.resumed/task.canceled
                 dag_id        TEXT NOT NULL,
                 task_id       TEXT,            -- dag.created 时为 NULL
                 attempt       INTEGER,         -- 任务当前尝试序号；dag.created 时为 NULL

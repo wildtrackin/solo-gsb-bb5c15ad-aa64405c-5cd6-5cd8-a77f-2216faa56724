@@ -110,3 +110,18 @@ def complete_task(task_id: str, body: CompleteIn):
 )
 def resume_task(task_id: str) -> dict:
     return service.resume_task(task_id)
+
+
+@app.post(
+    "/tasks/{task_id}/cancel",
+    summary="取消任务",
+    responses={
+        200: {"description": "目标已置为 canceled（running 任务立即终止当前 attempt 并清除租约）；"
+                             "尚未结束的后继已在同事务内递归取消"},
+        404: {"description": "任务不存在（task_not_found）"},
+        409: {"description": "任务不是 pending/running/blocked（task_not_cancelable）；"
+                             "succeeded/failed 以及重复取消同样返回 409 且不新增事件"},
+    },
+)
+def cancel_task(task_id: str) -> dict:
+    return service.cancel_task(task_id)

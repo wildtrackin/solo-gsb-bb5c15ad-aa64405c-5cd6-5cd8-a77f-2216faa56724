@@ -1958,3 +1958,395 @@ def test_openapi_documents_resume_endpoint(client):
     assert "200" in path["responses"]
     assert "404" in path["responses"]
     assert "409" in path["responses"]
+
+
+# ------------------------------------------------------------- 任务取消
+
+def test_cancel_pending_task_marks_canceled_and_emits_event(client):
+    dag = submit(client, [{"key": "a"}], dag_id="cx-p")
+    a = by_key(dag, "a")
+
+    r = client.post(f"/tasks/{a['id']}/cancel")
+    assert r.status_code == 200
+    body = r.json()
+    assert body == {"task_id": a["id"], "state": "canceled",
+                    "attempt": 0, "canceled_descendants": 0}
+
+    detail = client.get(f"/tasks/{a['id']}").json()
+    assert detail["state"] == "canceled"
+    assert detail["lease"] is None
+    assert detail["finished_at"] is not None
+
+    events = client.get("/events", params={"dag_id": "cx-p"}).json()["events"]
+    assert events[-1]["type"] == "task.canceled"
+    assert events[-1]["from_state"] == "pending"
+    assert events[-1]["to_state"] == "canceled"
+
+    # canceled 任务不再可被领取
+    assert client.post("/tasks/claim", json={"dag_id": "cx-p", "limit": 10}).json()["count"] == 0
+
+
+def test_cancel_running_task_terminates_attempt_and_old_token_gets_409(client):
+    dag = submit(client, [{"key": "a"}, {"key": "b", "deps": ["a"]}], dag_id="cx-r")
+    t = client.post("/tasks/claim", json={"dag_id": "cx-r"}).json()["claimed"][0]
+    token = t["lease_token"]
+
+    r = client.post(f"/tasks/{t['task_id']}/cancel")
+    assert r.status_code == 200
+    assert r.json()["state"] == "canceled"
+    assert r.json()["attempt"] == 1
+    # 未结束后继 b 一并取消
+    assert r.json()["canceled_descendants"] == 1
+
+    detail = client.get(f"/tasks/{t['task_id']}").json()
+    assert detail["state"] == "canceled"
+    assert detail["lease"] is None
+    assert detail["finished_at"] is not None
+    assert detail["attempts"][0]["state"] == "canceled"
+    b = by_key(client.get("/dags/cx-r").json(), "b")
+    assert b["state"] == "canceled"
+
+    # 旧 lease_token 的心跳与完成回报一律 409
+    r = client.post(f"/tasks/{t['task_id']}/heartbeat", json={"lease_token": token})
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "invalid_lease"
+    r = client.post(
+        f"/tasks/{t['task_id']}/complete",
+        json={"completion_id": "late-1", "lease_token": token, "success": True},
+    )
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "invalid_lease"
+
+    # 租约已清除：任务不会再被领取（不会产生新 attempt）
+    assert client.post("/tasks/claim", json={"dag_id": "cx-r", "limit": 10}).json()["count"] == 0
+    detail = client.get(f"/tasks/{t['task_id']}").json()
+    assert detail["attempt"] == 1
+
+    events = client.get("/events", params={"dag_id": "cx-r"}).json()["events"]
+    canceled = [e for e in events if e["type"] == "task.canceled"]
+    assert len(canceled) == 2
+    # 根任务的事件先于后继，保持因果顺序
+    assert canceled[0]["task_id"] == t["task_id"]
+    assert canceled[0]["from_state"] == "running"
+    assert canceled[1]["from_state"] == "pending"
+
+
+def test_cancel_blocked_task_clears_blocked_reason(client):
+    dag = submit(
+        client,
+        [{"key": "a", "max_retries": 0}, {"key": "b", "deps": ["a"]}],
+        dag_id="cx-b",
+    )
+    t = client.post("/tasks/claim", json={"dag_id": "cx-b"}).json()["claimed"][0]
+    _fail(client, t, "fx")
+    b = by_key(client.get("/dags/cx-b").json(), "b")
+    assert b["state"] == "blocked" and b["blocked_reason"] is not None
+
+    r = client.post(f"/tasks/{b['id']}/cancel")
+    assert r.status_code == 200
+    assert r.json()["canceled_descendants"] == 0
+
+    detail = client.get(f"/tasks/{b['id']}").json()
+    assert detail["state"] == "canceled"
+    assert detail["blocked_reason"] is None
+    assert detail["finished_at"] is not None
+
+    events = client.get("/events", params={"dag_id": "cx-b"}).json()["events"]
+    assert events[-1]["type"] == "task.canceled"
+    assert events[-1]["from_state"] == "blocked"
+    assert events[-1]["to_state"] == "canceled"
+
+
+def test_cancel_recursively_cancels_all_unfinished_descendants(client):
+    submit(
+        client,
+        [
+            {"key": "a"},
+            {"key": "b", "deps": ["a"]},
+            {"key": "c", "deps": ["a"]},
+            {"key": "d", "deps": ["b", "c"]},
+            {"key": "e", "deps": ["d"]},
+        ],
+        dag_id="cx-chain",
+    )
+    a = by_key(client.get("/dags/cx-chain").json(), "a")
+
+    r = client.post(f"/tasks/{a['id']}/cancel")
+    assert r.status_code == 200
+    assert r.json()["canceled_descendants"] == 4
+
+    full = client.get("/dags/cx-chain").json()
+    assert full["states"]["canceled"] == 5
+    assert full["task_count"] == 5
+    assert all(t["state"] == "canceled" for t in full["tasks"])
+
+    # 每个状态变化恰好一条 task.canceled 事件（加上 dag.created 共 6 条）
+    events = client.get("/events", params={"dag_id": "cx-chain", "limit": 100}).json()["events"]
+    canceled = [e for e in events if e["type"] == "task.canceled"]
+    assert len(canceled) == 5
+    by_evt_key = {next(t["id"] for t in full["tasks"] if t["key"] == k): k
+                  for k in "abcde"}
+    # 因果顺序：父任务先于子任务取消（a 在 b/c/d/e 之前）
+    order = [by_evt_key[e["task_id"]] for e in canceled]
+    assert order[0] == "a"
+    assert order.index("b") < order.index("d")
+    assert order.index("c") < order.index("d")
+    assert order.index("d") < order.index("e")
+
+
+def test_cancel_skips_finished_descendants_and_writes_no_duplicate_events(client):
+    """已 succeeded/failed/canceled 的后继保持不变，且不重复写事件。"""
+    import sqlite3
+    from app.db import db_path
+
+    submit(
+        client,
+        [{"key": f"k{i}", "deps": [f"k{i-1}"] if i else []} for i in range(5)],
+        dag_id="cx-mix",
+    )
+    full = client.get("/dags/cx-mix").json()
+    ids = {t["key"]: t["id"] for t in full["tasks"]}
+    now = "2026-01-02T00:00:00Z"
+
+    # 绕过正常流程直接制造混合终态：取消根 k0；k1 succeeded、k2 failed、
+    # k3 已 canceled 均应保持不变；只有 k4(pending) 被递归取消
+    conn = sqlite3.connect(db_path())
+    conn.execute("UPDATE tasks SET state='succeeded', finished_at=? WHERE id=?", (now, ids["k1"]))
+    conn.execute("UPDATE tasks SET state='failed', finished_at=? WHERE id=?", (now, ids["k2"]))
+    conn.execute("UPDATE tasks SET state='canceled', finished_at=? WHERE id=?", (now, ids["k3"]))
+    conn.commit()
+    conn.close()
+
+    r = client.post(f"/tasks/{ids['k0']}/cancel")
+    assert r.status_code == 200
+    assert r.json()["canceled_descendants"] == 1  # 只有 k4 变化
+
+    full = client.get("/dags/cx-mix").json()
+    states = {t["key"]: t["state"] for t in full["tasks"]}
+    assert states == {"k0": "canceled", "k1": "succeeded", "k2": "failed",
+                      "k3": "canceled", "k4": "canceled"}
+
+    # 仅 k0、k4 各一条 canceled 事件；已 canceled 的 k3 无重复事件
+    events = client.get("/events", params={"dag_id": "cx-mix", "limit": 100}).json()["events"]
+    canceled_targets = {e["task_id"] for e in events if e["type"] == "task.canceled"}
+    assert canceled_targets == {ids["k0"], ids["k4"]}
+
+
+def test_cancel_running_descendant_releases_lease(client):
+    """防御路径：后继处于 running（正常门控下不会出现）时同样终止其租约。"""
+    import sqlite3
+    from app.db import db_path
+
+    submit(client, [{"key": "a"}, {"key": "b", "deps": ["a"]}], dag_id="cx-rd")
+    full = client.get("/dags/cx-rd").json()
+    ids = {t["key"]: t["id"] for t in full["tasks"]}
+    # 手工把 b 置为带租约的 running，并补一条 active attempt
+    conn = sqlite3.connect(db_path())
+    conn.execute(
+        """INSERT INTO attempts (task_id, attempt_no, lease_token, worker_id,
+               leased_at, expires_at, state)
+           VALUES (?, 1, 'tok-b', 'w', '2026-01-01T00:00:00Z',
+                   '2099-01-01T00:00:00Z', 'active')""",
+        (ids["b"],),
+    )
+    conn.execute(
+        """UPDATE tasks SET state='running', attempt=1, lease_token='tok-b',
+               lease_expires_at='2099-01-01T00:00:00Z', worker_id='w'
+           WHERE id=?""",
+        (ids["b"],),
+    )
+    conn.commit()
+    conn.close()
+
+    r = client.post(f"/tasks/{ids['a']}/cancel")
+    assert r.status_code == 200
+    assert r.json()["canceled_descendants"] == 1
+
+    detail = client.get(f"/tasks/{ids['b']}").json()
+    assert detail["state"] == "canceled" and detail["lease"] is None
+    assert detail["attempts"][0]["state"] == "canceled"
+    r = client.post(f"/tasks/{ids['b']}/heartbeat", json={"lease_token": "tok-b"})
+    assert r.status_code == 409
+
+
+def test_cancel_rejects_terminal_states_and_unknown_task(client):
+    submit(client, [{"key": "a", "max_retries": 0}, {"key": "b", "deps": ["a"]}],
+           dag_id="cx-rej")
+    a = by_key(client.get("/dags/cx-rej").json(), "a")
+
+    # 未知任务 -> 404
+    r = client.post("/tasks/nonexistent/cancel")
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "task_not_found"
+
+    # pending 可取消；随后重复取消 -> 409（task_not_cancelable）
+    assert client.post(f"/tasks/{a['id']}/cancel").status_code == 200
+    r = client.post(f"/tasks/{a['id']}/cancel")
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "task_not_cancelable"
+    assert r.json()["error"]["details"]["state"] == "canceled"
+
+    # succeeded -> 409
+    submit(client, [{"key": "s"}], dag_id="cx-rej2")
+    t = client.post("/tasks/claim", json={"dag_id": "cx-rej2"}).json()["claimed"][0]
+    client.post(f"/tasks/{t['task_id']}/complete",
+                json={"completion_id": "ok", "lease_token": t["lease_token"], "success": True})
+    r = client.post(f"/tasks/{t['task_id']}/cancel")
+    assert r.status_code == 409
+    assert r.json()["error"]["details"]["state"] == "succeeded"
+
+    # failed -> 409
+    submit(client, [{"key": "f", "max_retries": 0}], dag_id="cx-rej3")
+    t = client.post("/tasks/claim", json={"dag_id": "cx-rej3"}).json()["claimed"][0]
+    client.post(f"/tasks/{t['task_id']}/complete",
+                json={"completion_id": "fx", "lease_token": t["lease_token"],
+                      "success": False, "error": "boom"})
+    r = client.post(f"/tasks/{t['task_id']}/cancel")
+    assert r.status_code == 409
+    assert r.json()["error"]["details"]["state"] == "failed"
+
+
+def test_cancel_twice_returns_409_and_adds_no_event(client):
+    submit(client, [{"key": "a"}, {"key": "b", "deps": ["a"]}], dag_id="cx-dup")
+    a = by_key(client.get("/dags/cx-dup").json(), "a")
+
+    r = client.post(f"/tasks/{a['id']}/cancel")
+    assert r.status_code == 200 and r.json()["canceled_descendants"] == 1
+    events = client.get("/events", params={"dag_id": "cx-dup"}).json()["events"]
+    n_events = len(events)
+    assert [e["type"] for e in events[-2:]] == ["task.canceled", "task.canceled"]
+
+    # 重复取消：409，不产生事件；后继再取消同样 409 无事件
+    assert client.post(f"/tasks/{a['id']}/cancel").status_code == 409
+    b = by_key(client.get("/dags/cx-dup").json(), "b")
+    assert client.post(f"/tasks/{b['id']}/cancel").status_code == 409
+    events_after = client.get("/events", params={"dag_id": "cx-dup"}).json()["events"]
+    assert len(events_after) == n_events
+
+
+def test_canceled_task_supports_state_filter_and_dag_counts(client):
+    submit(client, [{"key": "a"}, {"key": "b", "deps": ["a"]}], dag_id="cx-view")
+    a = by_key(client.get("/dags/cx-view").json(), "a")
+    client.post(f"/tasks/{a['id']}/cancel")
+
+    listed = client.get("/tasks", params={"dag_id": "cx-view", "state": "canceled"}).json()
+    assert listed["count"] == 2
+    assert {t["key"] for t in listed["tasks"]} == {"a", "b"}
+    assert client.get("/tasks", params={"state": "pending"}).json()["count"] == 0
+
+    full = client.get("/dags/cx-view").json()
+    assert full["states"] == {"pending": 0, "running": 0, "succeeded": 0,
+                              "failed": 0, "blocked": 0, "canceled": 2}
+
+
+def test_cancel_clears_backoff_and_releases_group_slot(client):
+    # 退避中的 pending 任务取消后不再受 next_eligible_at 影响（终态不可领）
+    submit(client, [{"key": "a", "max_retries": 1, "retry_backoff": BACKOFF}], dag_id="cx-bo")
+    t = client.post("/tasks/claim", json={"dag_id": "cx-bo"}).json()["claimed"][0]
+    _complete(client, t, "bf", success=False)
+    assert client.post("/tasks/claim", json={}).json()["count"] == 0
+    assert client.post(f"/tasks/{t['task_id']}/cancel").status_code == 200
+    detail = client.get(f"/tasks/{t['task_id']}").json()
+    assert detail["state"] == "canceled" and detail["next_eligible_at"] is None
+
+    # 取消 running 任务立即释放并发组名额
+    submit(
+        client,
+        [{"key": "g1", "concurrency_group": "cxg", "concurrency_limit": 1}],
+        dag_id="cx-g1",
+    )
+    submit(
+        client,
+        [{"key": "g2", "concurrency_group": "cxg", "concurrency_limit": 1}],
+        dag_id="cx-g2",
+    )
+    tg = client.post("/tasks/claim", json={}).json()["claimed"][0]
+    assert client.post("/tasks/claim", json={}).json()["count"] == 0
+    client.post(f"/tasks/{tg['task_id']}/cancel")
+    nxt = client.post("/tasks/claim", json={}).json()["claimed"]
+    assert len(nxt) == 1 and nxt[0]["task_key"] == "g2"
+
+
+def test_cancel_rolls_back_on_conflict(client):
+    """取消事务与并发写事务互斥：任一异常整体回滚，不留半截事件。"""
+    import threading
+
+    submit(client, [{"key": "a"}, {"key": "b", "deps": ["a"]}], dag_id="cx-conc")
+    a = by_key(client.get("/dags/cx-conc").json(), "a")
+
+    # 并发对同一任务取消：恰好一个 200，另一个 409
+    results = []
+
+    def do_cancel():
+        r = client.post(f"/tasks/{a['id']}/cancel")
+        results.append(r.status_code)
+
+    threads = [threading.Thread(target=do_cancel) for _ in range(2)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    assert sorted(results) == [200, 409]
+
+    # 只成功一次：a、b 各一条取消事件，无重复
+    events = client.get("/events", params={"dag_id": "cx-conc"}).json()["events"]
+    assert [e["type"] for e in events if e["type"] == "task.canceled"] == [
+        "task.canceled", "task.canceled"
+    ]
+
+
+def test_legacy_sqlite_db_supports_cancel(tmp_path, monkeypatch):
+    """旧版 SQLite 库（state 为自由 TEXT）升级后可直接取消任务并写事件。"""
+    import sqlite3
+
+    db_file = tmp_path / "legacy-cancel.db"
+    conn = sqlite3.connect(db_file)
+    conn.executescript(
+        """
+        CREATE TABLE dags (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY, dag_id TEXT NOT NULL, task_key TEXT NOT NULL, name TEXT NOT NULL,
+            payload TEXT, max_retries INTEGER NOT NULL DEFAULT 0, lease_seconds REAL NOT NULL,
+            state TEXT NOT NULL, blocked_reason TEXT, lease_token TEXT, lease_expires_at TEXT,
+            worker_id TEXT, attempt INTEGER NOT NULL DEFAULT 0, failure_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+            UNIQUE(dag_id, task_key));
+        CREATE TABLE dependencies (dag_id TEXT, task_key TEXT, dep_key TEXT,
+            PRIMARY KEY (dag_id, task_key, dep_key));
+        CREATE TABLE events (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT NOT NULL,
+            dag_id TEXT NOT NULL, task_id TEXT, attempt INTEGER, from_state TEXT,
+            to_state TEXT, occurred_at TEXT NOT NULL);
+        INSERT INTO dags VALUES ('d1', 'old', '2026-01-01T00:00:00Z');
+        INSERT INTO tasks (id, dag_id, task_key, name, max_retries, lease_seconds, state,
+                           attempt, created_at)
+        VALUES ('t1', 'd1', 'a', 'a', 0, 30, 'pending', 0, '2026-01-01T00:00:00Z');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setenv("DB_PATH", str(db_file))
+    from app.db import init_db
+    from app import service
+
+    init_db()
+    init_db()  # 迁移幂等
+
+    result = service.cancel_task("t1")
+    assert result["state"] == "canceled" and result["canceled_descendants"] == 0
+    assert service.get_task("t1")["state"] == "canceled"
+    # 重复取消：409 且不产生事件
+    with pytest.raises(service.APIError) as exc:
+        service.cancel_task("t1")
+    assert exc.value.status_code == 409
+    events = service.list_events(0, 50, None)["events"]
+    assert [e["type"] for e in events] == ["task.canceled"]
+
+
+def test_openapi_documents_cancel_endpoint(client):
+    spec = client.get("/openapi.json").json()
+    path = spec["paths"]["/tasks/{task_id}/cancel"]["post"]
+    assert "200" in path["responses"]
+    assert "404" in path["responses"]
+    assert "409" in path["responses"]
